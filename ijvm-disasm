@@ -1,152 +1,320 @@
 #!/usr/bin/env python
 import sys
 import re
-import math
 import struct
+from binascii import hexlify
 
-struct_formats = [None, 'B', 'H', None, 'I', None, None, None, 'Q']
+def int_log2(n):
+	i = -1
+	while n != 0:
+		n >>= 1
+		i += 1
+	return i
 
-if len(sys.argv) != 2:
-	print 'Usage: {} bc-file'.format(sys.argv[0])
-	sys.exit(1)
+def struct_unpack_format(n_bytes, signed=False, endian='>'):
+	formats = ['B', 'H', 'I', 'Q']
+	fmt = formats[int_log2(n_bytes)]
 
-with open(sys.argv[1]) as f:
-    contents = f.read()
+	if signed:
+		fmt = fmt.lower()
 
-match = re.search(r'^main index: (.*)\nmethod area:.*\n((?:.|\n)*)\nconstant pool:.*\n((?:.|\n)*)$', contents)
-if not match:
-	print 'Failed to parse bc file!'
-	sys.exit(1)
+	return endian + fmt
 
-main_index_string, hexstring, constsstring = match.groups()
-hexpairs = map(lambda x: int(x, 16), hexstring.replace('\n', ' ').strip().split(' '))
+def struct_unpack(bytearr, signed=False, endian='>'):
+	fmt = struct_unpack_format(len(bytearr), signed=signed, endian=endian)
+	return struct.unpack(fmt, bytearr)[0]
 
-consts = map(lambda x: int(x, 16), constsstring.strip().split('\n'))
-main_index = int(main_index_string)
+class ArgType:
+	def __init__(self, size, name=None, signed=False, endian='>', comment=None):
+		self.size = size
+		self.name = name
+		self.signed = signed
+		self.endian = endian
+		self.comment = comment
 
-no_args = [0x00]
-byte_exp = [0x01]
-label = [0x02]
-const_exp = [0x02]
-method = [0x02]
-varnum_exp = [0x01]
+	def get_size(self, prefixes):
+		if type(self.size) == int:
+			return self.size
+		else:
+			return self.size(prefixes)
 
-ops = [
-	(0x00, 'nop',           no_args),
-	(0x10, 'bipush',        byte_exp),
-	(0x13, 'ldc_w',         const_exp),
-	(0x15, 'iload',         varnum_exp),
-	(0x36, 'istore',        varnum_exp),
-	(0x57, 'pop',           no_args),
-	(0x59, 'dup',           no_args),
-	(0x5f, 'swap',          no_args),
-	(0x60, 'iadd',          no_args),
-	(0x64, 'isub',          no_args),
-	(0x7e, 'iand',          no_args),
-	(0x80, 'ior',           no_args),
-	(0x84, 'iinc',          [byte_exp, byte_exp]), # really takes a varnum_exp, but it can't be wide
-	(0x99, 'ifeq',          label),
-	(0x9b, 'iflt',          label),
-	(0x9f, 'if_icmpeq',     label),
-	(0xa7, 'goto',          label),
-	(0xac, 'ireturn',       no_args),
-	(0xb6, 'invokevirtual', method)
-]
+	def value_with_bytes(self, bytearr, prefixes, offset):
+		size = self.get_size(prefixes)
+		return [struct_unpack(bytearr[offset:offset + size], signed=self.signed, endian=self.endian)]
 
-max_address_width = int(math.log(len(hexpairs), 16)) + 1
-max_opcode_width = 3 * 3 -1
-max_instruction_width = len('invokevirtual 655365')
+	def representation_with_bytes(self, bytearr, prefixes, offset):
+		return str(self.value_with_bytes(bytearr, prefixes, offset)[0])
 
-print '; Method area:'
+	def comment_with_bytes(self, bytearr, prefixes, offset):
+		value = self.value_with_bytes(bytearr, prefixes, offset)[0]
+		return self.comment(offset, value) if self.comment else ''
 
-i = 0
-while i < len(hexpairs):
-	if i in consts and hexpairs[i] == 0x00:
-		args = hexpairs[i] * 256 + hexpairs[i + 1]
-		_locals = hexpairs[i + 2] * 256 + hexpairs[i + 3]
-		print '\n; {}{}\n; args: {}, locals: {}'.format(
-			hex(i),
-			' (main)' if i == main_index else '',
-			args,
-		_locals)
-		i += 4
-	else:
-		prefix = ''
-		address = i
-		wide = False
-		while hexpairs[i] == 0xc4:
-			prefix += 'wide '
-			wide = True
+class CompositeArgType:
+	def __init__(self, sub_args, name=None):
+		self.sub_args = sub_args
+		self.name = name
+
+	def __nonzero__(self):
+		return len(self.sub_args) > 0
+
+	def get_size(self, prefixes):
+		return sum(map(lambda a: a.get_size(prefixes), self.sub_args))
+
+	def value_with_bytes(self, bytearr, prefixes, offset):
+		return map(lambda a: a.value_with_byte(bytearr, prefixes, offset), self.sub_args)
+
+	def representation_with_bytes(self, bytearr, prefixes, offset):
+		arg_reps = []
+		for arg in self.sub_args:
+			arg_reps.append(arg.representation_with_bytes(bytearr, prefixes, offset))
+			offset += arg.get_size(prefixes)
+
+		return ', '.join(arg_reps)
+
+	def comment_with_bytes(self, bytearr, prefixes, offset):
+		return ', '.join(filter(lambda x: x, map(lambda a: a.comment_with_bytes(bytearr, prefixes, offset), self.sub_args)))
+
+class Instruction:
+	ins_prefixes = {
+		0xc4: 'wide'
+	}
+
+	ops = {
+		0x00: ('nop',           'no_args'),
+		0x10: ('bipush',        'byte_exp'),
+		0x13: ('ldc_w',         'const_exp'),
+		0x15: ('iload',         'varnum_exp'),
+		0x36: ('istore',        'varnum_exp'),
+		0x57: ('pop',           'no_args'),
+		0x59: ('dup',           'no_args'),
+		0x5f: ('swap',          'no_args'),
+		0x60: ('iadd',          'no_args'),
+		0x64: ('isub',          'no_args'),
+		0x7e: ('iand',          'no_args'),
+		0x80: ('ior',           'no_args'),
+		0x84: ('iinc',          'iinc_args'),
+		0x99: ('ifeq',          'label'),
+		0x9b: ('iflt',          'label'),
+		0x9f: ('if_icmpeq',     'label'),
+		0xa7: ('goto',          'label'),
+		0xac: ('ireturn',       'no_args'),
+		0xb6: ('invokevirtual', 'method')
+	}
+
+	def __init__(self, parser, address):
+		self.arg_types = {
+			'byte_exp':   ArgType(0x01, name='byte_exp', signed=True),
+			'label':      ArgType(0x02, name='label', signed=True, comment=lambda offset, value: 'address: ' + hex(offset + value - 1)),
+			'const_exp':  ArgType(0x02, name='const_exp', comment=self.const_comment),
+			'method':     ArgType(0x02, name='method', comment=self.method_comment),
+			'varnum_exp': ArgType(lambda prefixes: 0x02 if 'wide' in prefixes else 0x01, name='varnum_exp'),
+
+			'no_args': CompositeArgType([], name='no_args'),
+		}
+		# iinc really takes a varnum_exp, but it can't be wide,
+		# so it is exactly the same as byte_exp
+		self.arg_types['iinc_args'] = CompositeArgType([self.arg_types['byte_exp']] * 2, name='iinc_args')
+
+		self.parser = parser
+		self.address = address
+
+		self.prefixes = []
+		i = address
+		while parser.bytearr[i] in self.ins_prefixes:
+			self.prefixes.append(self.ins_prefixes[parser.bytearr[i]])
 			i += 1
 
-		res = filter(lambda x: x[0] == hexpairs[i], ops)
-		if len(res) == 0:
-			print 'Failed to decode instruction at address {}'.format(i)
-			sys.exit(1)
+		self.op = parser.bytearr[i]
+		if not self.op in self.ops:
+			raise Exception('Unknown opcode: 0x{:x}'.format(op))
 
-		i += 1
+		self.mnemonic, arg_type_name = self.ops[self.op]
+		self.arg_type = self.arg_types[arg_type_name]
 
-		opcode, mnemonic, args = res[0]
-		if type(args[0]) != list:
-			args = [args]
-		args_size = sum(map(lambda x: x[0], args))
-		if wide:
-			varnum_exps = sum(map(lambda x: int(x is varnum_exp), args))
-			args_size += varnum_exps
+		self.arg_offset = len(self.prefixes) + 1
+		self.size = self.arg_offset + self.arg_type.get_size(self.prefixes)
 
-		instruction = prefix + mnemonic
+	def const_value(self, value):
+		if 0 <= value < len(self.parser.consts):
+			return self.parser.consts[value]
+		else:
+			return None
 
-		res = '{}:  {}'.format(
-			hex(address).replace('0x', '').zfill(max_address_width),
-			' '.join(map(lambda x: hex(x).replace('0x', '').zfill(2), hexpairs[address:i + args_size])).ljust(max_opcode_width),
+	def const_comment(self, offset, value):
+		loc_val = self.const_value(value)
+		if loc_val:
+			return 'const value: ' + hex(loc_val)
+		else:
+			return 'unknown const'
+
+	def method_comment(self, offset, value):
+		special_labels = {
+			0x8001: 'putchar',
+			0x8000: 'getchar'
+		}
+
+		if value in special_labels:
+			return 'special method: ' + special_labels[value]
+
+		loc_val = self.const_value(value)
+		if loc_val is not None:
+			return 'method location: ' + hex(loc_val)
+		else:
+			return 'unknown const'
+
+	def get_arg_values(self):
+		return self.arg_type.value_with_bytes(self.parser.bytearr, self.prefixes, self.address + self.arg_offset)
+
+	def get_hex_str(self):
+		hexstr = hexlify(self.parser.bytearr[self.address:self.address + self.size])
+		return re.sub(r'([0-9a-f]{2})', r'\1 ', hexstr).strip()
+
+	def get_prefix_str(self):
+		return ' '.join(self.prefixes) + ' ' if self.prefixes else ''
+
+	def get_ins_str(self):
+		return '{}{}{}'.format(
+			self.get_prefix_str(),
+			self.mnemonic,
+			' ' + self.arg_type.representation_with_bytes(self.parser.bytearr, self.prefixes, self.address + self.arg_offset) if self.arg_type else ''
 		)
-		if args_size != 0:
-			arg_values = []
-			comments = []
-			for a in args:
-				size = a[0]
-				arg_list = hexpairs[i:i + size]
-				comment = None
 
-				fmt = struct_formats[len(arg_list)]
-				signed_arg = a is byte_exp or a is label
-				if signed_arg:
-					fmt = fmt.lower()
+	def get_comment_str(self):
+		comment = self.arg_type.comment_with_bytes(self.parser.bytearr, self.prefixes, self.address + self.arg_offset)
+		if comment:
+			return ' ; ' + comment
+		else:
+			return ''
 
-				arg = struct.unpack(">" + fmt, bytearray(arg_list))[0]
+	def __repr__(self):
+		return '{:0{}x}:  {:<{}}  {:<{}}{}'.format(
+			self.address,       self.parser.max_address_width,
+			self.get_hex_str(), self.parser.max_hex_width,
+			self.get_ins_str(), self.parser.max_ins_width,
+			self.get_comment_str()
+		)
 
-				if mnemonic == 'invokevirtual':
-					comment = 'method location: '
-					if arg == 0x8001:
-						comment += 'putchar'
-					elif arg == 0x8000:
-						comment += 'getchar'
-					elif 0 <= arg < len(consts):
-						comment += hex(consts[arg])
-					else:
-						comment = 'unknown const'
-				elif a is const_exp:
-					if 0 <= arg < len(consts):
-						comment = 'const value: ' + hex(consts[arg])
-					else:
-						comment = 'unknown const'
-				elif a is label:
-					comment = 'location: ' + hex(address + arg)
+class Method:
+	def __init__(self, parser, address):
+		self.parser = parser
+		self.address = address
 
-				arg_values.append(str(arg))
-				if comment:
-					comments.append(comment)
+		self.args = parser.bytearr[address] * 256 + parser.bytearr[address + 1]
+		self.locals = parser.bytearr[address + 2] * 256 + parser.bytearr[address + 3]
 
-				i += size
+	def get_name(self):
+		if self.address in self.parser.consts:
+			index = self.parser.consts.index(self.address)
+			if index == self.parser.main_index:
+				return 'main (const_{})'.format(index)
+			else:
+				return 'const_{}'.format(index)
+		else:
+			return None
 
-			instruction += ' ' + ', '.join(arg_values)
-			res += '  {}{}'.format(
-				instruction.ljust(max_instruction_width),
-				'' if not comments else ' ; ' + ', '.join(comments)
-			)
+	def __repr__(self):
+		name = self.get_name()
+		name_str = ' - ' + name if name else ''
+		return '\n; 0x{:x}{}\n; args: {}, locals: {}'.format(
+			self.address,
+			name_str,
+			self.args,
+			self.locals
+		)
 
-		print res
+class Label:
+	def __init__(self, address):
+		self.address = address
 
-print '\n; Constant area:'
-for i, c in enumerate(consts):
-	print '{}: {}'.format(i, hex(c).replace('0x', '').zfill(8))
+	def __repr__(self):
+		return '\n; Label: loc_0x{:x}'.format(self.address)
+
+
+class IJVM_bc_parser:
+	def __init__(self, file_contents):
+		self.max_hex_width = 0
+		self.max_ins_width = 0
+
+		match = re.search(r'^main index: (.*)\nmethod area:.*\n((?:.|\n)*)\nconstant pool:.*\n((?:.|\n)*)$', file_contents)
+		if not match:
+			raise Exception('Failed to parse bc file!')
+
+		main_index_string, hexstring, constsstring = match.groups()
+		hexpairs = map(lambda x: int(x, 16), hexstring.replace('\n', ' ').strip().split(' '))
+		self.bytearr = bytearray(hexpairs)
+
+		self.consts = map(lambda x: int(x, 16), constsstring.strip().split('\n'))
+		self.main_index = int(main_index_string)
+
+		self.max_address_width = int_log2(len(hexpairs)) / 4 + 1
+
+		self.methods_and_ins = []
+		self.labels = {}
+
+		i = 0
+		while i < len(hexpairs):
+			# FIXME: Assumes a method has less than 256 arguments
+			if i in self.consts and hexpairs[i] == 0x00:
+				self.methods_and_ins.append(Method(self, i))
+				i += 4
+			else:
+				ins = Instruction(self, i)
+
+				hex_width = len(ins.get_hex_str())
+				ins_width = len(ins.get_ins_str())
+				self.max_hex_width = max(hex_width, self.max_hex_width)
+				self.max_ins_width = max(ins_width, self.max_ins_width)
+
+				self.methods_and_ins.append(ins)
+				if ins.arg_type.name == 'label':
+					label_address = i + ins.get_arg_values()[0]
+					self.labels[label_address] = Label(label_address)
+
+				i += ins.size
+
+	def get_output(self):
+		header = '; ' + '=' * 20
+
+		output = header + '\n; Method area:'
+		for method_or_ins in self.methods_and_ins:
+			address = method_or_ins.address
+			if address in self.labels:
+				output += '{}\n'.format(self.labels[address])
+
+			output += '{}\n'.format(method_or_ins)
+
+		output += '\n' + header + '\n; Constant area:\n'
+		for i, c in enumerate(self.consts):
+			output += '{}: {:08x}\n'.format(i, c)
+
+		return output
+
+def main(argv):
+	if len(sys.argv) < 2:
+		print 'Usage: {} bc-file [bc-file2 ...]'.format(sys.argv[0])
+		return 1
+
+	multiple = len(sys.argv) > 2
+
+	first = True
+	for fname in sys.argv[1:]:
+		if multiple:
+			print '{}{}:'.format('' if first else '\n', fname)
+			first = False
+
+		if fname == '-':
+			f = sys.stdin
+		else:
+			f = open(fname, 'r')
+
+		contents = f.read()
+		f.close()
+
+		parser = IJVM_bc_parser(contents)
+
+		print parser.get_output(),
+
+	return 0
+
+if __name__ == '__main__':
+	sys.exit(main(sys.argv))

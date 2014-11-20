@@ -25,12 +25,13 @@ def struct_unpack(bytearr, signed=False, endian='>'):
 	return struct.unpack(fmt, bytearr)[0]
 
 class ArgType:
-	def __init__(self, size, name=None, signed=False, endian='>', comment=None):
+	def __init__(self, size, name=None, signed=False, endian='>', hex_format=False, comment=None):
 		self.size = size
 		self.name = name
 		self.signed = signed
 		self.endian = endian
 		self.comment = comment
+		self.hex_format = hex_format
 
 	def get_size(self, prefixes):
 		if type(self.size) == int:
@@ -43,7 +44,8 @@ class ArgType:
 		return [struct_unpack(bytearr[offset:offset + size], signed=self.signed, endian=self.endian)]
 
 	def representation_with_bytes(self, bytearr, prefixes, offset):
-		return str(self.value_with_bytes(bytearr, prefixes, offset)[0])
+		value = self.value_with_bytes(bytearr, prefixes, offset)[0]
+		return hex(value) if self.hex_format else str(value)
 
 	def comment_with_bytes(self, bytearr, prefixes, offset):
 		value = self.value_with_bytes(bytearr, prefixes, offset)[0]
@@ -104,7 +106,7 @@ class Instruction:
 	def __init__(self, parser, address):
 		self.arg_types = {
 			'byte_exp':   ArgType(0x01, name='byte_exp', signed=True),
-			'label':      ArgType(0x02, name='label', signed=True, comment=lambda offset, value: 'address: ' + hex(offset + value - 1)),
+			'label':      ArgType(0x02, name='label', signed=True, hex_format=True, comment=lambda offset, value: 'address: ' + hex(offset + value - 1)),
 			'const_exp':  ArgType(0x02, name='const_exp', comment=self.const_comment),
 			'method':     ArgType(0x02, name='method', comment=self.method_comment),
 			'varnum_exp': ArgType(lambda prefixes: 0x02 if 'wide' in prefixes else 0x01, name='varnum_exp'),
